@@ -1,0 +1,9 @@
+# dataset (licence: hackathon use only, no redistribution) and large generated files
+*.mcap
+metadata.yaml
+*.pdf
+gt.csv
+cache/
+out/
+__pycache__/
+*.pyc
