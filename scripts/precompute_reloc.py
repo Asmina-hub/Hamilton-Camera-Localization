@@ -23,20 +23,19 @@ from camloc import landmarks as L
 _W = {}
 
 
-def _init(cache, map_path, cam_name):
+def _init(cam_name):
+    cv2.setNumThreads(1)          # one process per core; avoid oversubscribing the CPU
     _W['sift'] = L.make_sift()
     _W['mask'] = (~body_masks()[cam_name]).astype(np.uint8) * 255
-    _W['map'] = L.LandmarkMap(map_path, load_cameras(f'{cache}/calib.json')[cam_name])
 
 
-def _work(item):
+def _features(item):
+    """Worker (CPU): decode + SIFT. Matching and PnP run in the main process, which owns the GPU."""
     t, jpeg, pred = item
     tic = time.perf_counter()
     g = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_GRAYSCALE)
     p, d = L.extract(_W['sift'], g, _W['mask'])
-    r = _W['map'].localize(p, d, pred)
-    r.update(timestamp_ns=t, ms=(time.perf_counter() - tic) * 1e3)
-    return r
+    return t, p, d, pred, (time.perf_counter() - tic) * 1e3
 
 
 def main():
@@ -58,17 +57,22 @@ def main():
                 t = msg.header.stamp.sec * 10**9 + msg.header.stamp.nanosec
                 yield t, bytes(msg.data), pred(t)
 
+    lmap = L.LandmarkMap(a.map, load_cameras(f'{a.cache}/calib.json')[a.cam])
     rows, tic = [], time.time()
-    with Pool(a.workers, initializer=_init, initargs=(a.cache, a.map, a.cam)) as pool:
-        for i, r in enumerate(pool.imap(_work, items(), chunksize=4)):
+    with Pool(a.workers, initializer=_init, initargs=(a.cam,)) as pool:
+        for i, (t, p, d, pr_, ms_feat) in enumerate(pool.imap(_features, items(), chunksize=4)):
+            t1 = time.perf_counter()
+            r = lmap.localize(p, d, pr_)
+            r.update(timestamp_ns=t, ms_feat=ms_feat, ms_loc=(time.perf_counter() - t1) * 1e3)
             rows.append(r)
             if i % 1000 == 0:
                 ok = np.mean([x['ok'] for x in rows]) * 100
                 print(f'{i} frames, {ok:.0f} % solved, {i / (time.time() - tic + 1e-9):.1f} fps', flush=True)
-    df = pd.DataFrame(rows)[['timestamp_ns', 'ok', 'x', 'y', 'yaw', 'n_match', 'n_inl', 'ms']]
+    df = pd.DataFrame(rows)[['timestamp_ns', 'ok', 'x', 'y', 'yaw', 'n_match', 'n_inl', 'ms_feat', 'ms_loc']]
     df['ok'] = df.ok.astype(int)
     df.to_csv(a.out, index=False, float_format='%.6f')
-    print(f'{len(df)} frames -> {a.out}  solved {df.ok.mean() * 100:.0f} %  median {df.ms.median():.0f} ms/frame/worker')
+    print(f'{len(df)} frames -> {a.out}  solved {df.ok.mean() * 100:.0f} %  features {df.ms_feat.median():.0f} ms/worker, '
+          f'localize {df.ms_loc.median():.0f} ms (median)')
 
 
 if __name__ == '__main__':

@@ -21,7 +21,12 @@ from camloc import landmarks as L
 _W = {}
 
 
+def _init_threads():
+    cv2.setNumThreads(1)          # one process per core; avoid oversubscribing the CPU
+
+
 def _init(cam_name):
+    _init_threads()
     _W['sift'] = L.make_sift()
     _W['mask'] = (~body_masks()[cam_name]).astype(np.uint8) * 255
 

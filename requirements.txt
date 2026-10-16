@@ -5,3 +5,4 @@ pandas
 scipy
 opencv-python>=4.4
 matplotlib
+torch  # optional: GPU matching (pip install torch --index-url https://download.pytorch.org/whl/cu126)

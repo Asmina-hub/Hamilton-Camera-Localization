@@ -55,11 +55,62 @@ def triangulate(cam, T_map_base_i, T_map_base_j, pi, pj, max_err_px=2.0, z_max=3
 class LandmarkMap:
     """pts (N, 3) map frame, desc (N, 128) uint8, src (N, 3) x, y, yaw of the camera pose that saw it."""
 
-    def __init__(self, path, cam):
+    CHUNK = 16384             # landmarks per GPU distance block (2000 x 16384 floats = 128 MB)
+
+    def __init__(self, path, cam, device='auto'):
         d = np.load(path)
         self.pts, self.desc, self.src = d['pts'], d['desc'], d['src']
         self.cam = cam
-        self.bf = cv2.BFMatcher(cv2.NORM_L2)
+        self.torch = None
+        if device != 'cpu':
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    self.torch, self.dev = torch, torch.device('cuda')
+                    self.desc_t = torch.from_numpy(self.desc).to(self.dev, torch.float32)
+                    self.desc_sq = (self.desc_t ** 2).sum(1)
+                    self.src_t = torch.from_numpy(self.src).to(self.dev)
+            except ImportError:
+                pass
+        if self.torch is None:
+            self.bf = cv2.BFMatcher(cv2.NORM_L2)
+
+    def _near(self, pred, radius, max_dyaw):
+        if self.torch is not None:
+            s = self.src_t
+            d2 = (s[:, 0] - pred[0]) ** 2 + (s[:, 1] - pred[1]) ** 2
+            dyaw = self.torch.remainder(s[:, 2] - pred[2] + np.pi, 2 * np.pi) - np.pi
+            return self.torch.nonzero((d2 < radius ** 2) & (dyaw.abs() < max_dyaw)).squeeze(1)
+        dx, dy = self.src[:, 0] - pred[0], self.src[:, 1] - pred[1]
+        dyaw = np.abs(np.angle(np.exp(1j * (self.src[:, 2] - pred[2]))))
+        return np.where((dx * dx + dy * dy < radius ** 2) & (dyaw < max_dyaw))[0]
+
+    def _match(self, des, near, ratio):
+        """Ratio-test nearest neighbours of des among the landmarks `near` -> (query idx, landmark idx)."""
+        if self.torch is not None:
+            th = self.torch
+            q = th.from_numpy(des).to(self.dev, th.float32)
+            qs = (q ** 2).sum(1, keepdim=True)
+            best_v, best_i = None, None
+            for c in range(0, len(near), self.CHUNK):        # chunked: bounded GPU memory, running top-2
+                nc = near[c:c + self.CHUNK]
+                d2 = qs + self.desc_sq[nc][None] - 2 * q @ self.desc_t[nc].T
+                v, i = th.topk(d2, min(2, len(nc)), dim=1, largest=False)
+                i = i + c
+                if best_v is not None:
+                    v, j = th.topk(th.cat([best_v, v], 1), 2, dim=1, largest=False)
+                    i = th.gather(th.cat([best_i, i], 1), 1, j)
+                best_v, best_i = v, i
+            if best_v.shape[1] < 2:
+                return np.zeros(0, int), np.zeros(0, int)
+            val, idx = best_v, best_i
+            dist = val.clamp_min(0).sqrt()
+            ok = dist[:, 0] < ratio * dist[:, 1]
+            qi = self.torch.nonzero(ok).squeeze(1)
+            return qi.cpu().numpy(), near[idx[qi, 0]].cpu().numpy()
+        m = self.bf.knnMatch(des.astype(np.float32), self.desc[near].astype(np.float32), k=2)
+        m = [p[0] for p in m if len(p) == 2 and p[0].distance < ratio * p[1].distance]
+        return np.array([x.queryIdx for x in m], int), near[np.array([x.trainIdx for x in m], int)]
 
     def localize(self, pts2d, des, pred, radius=30.0, max_dyaw=np.radians(45), ratio=0.8,
                  reproj=3.0, min_inliers=12):
@@ -67,18 +118,15 @@ class LandmarkMap:
 
         Returns dict(ok, x, y, yaw, n_match, n_inl)."""
         out = dict(ok=False, x=np.nan, y=np.nan, yaw=np.nan, n_match=0, n_inl=0)
-        dx, dy = self.src[:, 0] - pred[0], self.src[:, 1] - pred[1]
-        dyaw = np.abs(np.angle(np.exp(1j * (self.src[:, 2] - pred[2]))))
-        near = np.where((dx * dx + dy * dy < radius ** 2) & (dyaw < max_dyaw))[0]
+        near = self._near(pred, radius, max_dyaw)
         if len(near) < 20 or len(des) < 20:
             return out
-        m = self.bf.knnMatch(des.astype(np.float32), self.desc[near].astype(np.float32), k=2)
-        m = [p[0] for p in m if len(p) == 2 and p[0].distance < ratio * p[1].distance]
-        out['n_match'] = len(m)
-        if len(m) < min_inliers:
+        qi, li = self._match(des, near, ratio)
+        out['n_match'] = len(qi)
+        if len(qi) < min_inliers:
             return out
-        img = pts2d[[x.queryIdx for x in m]].astype(np.float64)
-        obj = self.pts[near][[x.trainIdx for x in m]].astype(np.float64)
+        img = pts2d[qi].astype(np.float64)
+        obj = self.pts[li].astype(np.float64)
         ok, rvec, tvec, inl = cv2.solvePnPRansac(obj, img, self.cam.K, self.cam.D, reprojectionError=reproj,
                                                  iterationsCount=300, flags=cv2.SOLVEPNP_EPNP)
         if not ok or inl is None or len(inl) < min_inliers:
