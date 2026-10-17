@@ -9,7 +9,7 @@
     --cmd placeholders: {mcap} test file, {csv} submission path, {dir} test folder. Without --cmd only the
     test files are built.
 
-Writes <root>/results.csv and <root>/results.md (one row per lap x scenario, with the change vs clean).
+Writes <root>/results[_<tag>].csv and .md (one row per lap x scenario, with the change vs clean).
 Test files are reused when they exist (--rebuild to force); submissions are re-run unless --skip-run-existing.
 """
 import argparse, os, re, shlex, subprocess, sys, time
@@ -40,11 +40,16 @@ def main():
     ap.add_argument('--suite', default=None); ap.add_argument('--presets', default=None)
     ap.add_argument('--specs', default=None, help='"name=spec;name2=spec2"')
     ap.add_argument('--cmd', default=None)
+    ap.add_argument('--tag', default='', help='name of this pipeline variant: writes submission_<tag>.csv, '
+                    'run_<tag>.log, results_<tag>.csv/md, so several variants share the same test files')
     ap.add_argument('--root', default='out/testsets')
     ap.add_argument('--seed', type=int, default=0); ap.add_argument('--workers', type=int, default=4)
     ap.add_argument('--rebuild', action='store_true'); ap.add_argument('--skip-run-existing', action='store_true')
     ap.add_argument('--timeout-s', type=float, default=7200)
+    ap.add_argument('--wait-built', type=float, default=0, help='seconds: wait for another job to build each test '
+                    'file instead of building it here (run a second variant alongside the first); 0 = build')
     a = ap.parse_args()
+    sfx = f'_{a.tag}' if a.tag else ''
 
     scen = {}
     names = SUITES[a.suite] if a.suite else (a.presets.split(',') if a.presets else [])
@@ -61,40 +66,45 @@ def main():
         t0, t1 = int(laps.loc[lap, 't0_ns']), int(laps.loc[lap, 't1_ns'])
         for name, spec in scen.items():
             d = os.path.join(a.root, f'lap{lap}_{name}')
+            waited = 0
+            while a.wait_built and not os.path.exists(os.path.join(d, 'manifest.json')) and waited < a.wait_built:
+                if waited == 0:
+                    print(f'[wait]  lap {lap} {name}: test file not built yet', flush=True)
+                time.sleep(30); waited += 30
             if a.rebuild or not os.path.exists(os.path.join(d, 'manifest.json')):
                 print(f'[build] lap {lap} {name}: {spec!r}', flush=True)
                 build(a.bag, a.gt, d, t0, t1, spec, a.seed, a.workers, label=f'lap{lap}_{name}')
             row = dict(lap=lap, scenario=name, spec=spec)
             if a.cmd:
-                csv = os.path.join(d, 'submission.csv')
+                csv = os.path.join(d, f'submission{sfx}.csv')
                 if not (a.skip_run_existing and os.path.exists(csv)):
                     cmd = a.cmd.format(mcap=shlex.quote(os.path.join(d, 'test.mcap')), csv=shlex.quote(csv),
                                        dir=shlex.quote(d))
                     print(f'[run]   {cmd}', flush=True)
                     tic = time.time()
-                    with open(os.path.join(d, 'run.log'), 'w') as log:
+                    with open(os.path.join(d, f'run{sfx}.log'), 'w') as log:
                         r = subprocess.run(cmd, shell=True, stdout=log, stderr=subprocess.STDOUT, timeout=a.timeout_s)
                     row.update(exit=r.returncode, run_s=round(time.time() - tic, 1))
                 if os.path.exists(csv):
                     row.update(score(os.path.join(d, 'gt.csv'), csv))
             rows.append(row)
-            pd.DataFrame(rows).to_csv(os.path.join(a.root, 'results.csv'), index=False)
+            pd.DataFrame(rows).to_csv(os.path.join(a.root, f'results{sfx}.csv'), index=False)
 
     df = pd.DataFrame(rows)
     if 'rmse' in df:
         base = df[df.scenario == 'clean'].set_index('lap')
         for m in ('rmse', 'lateral', 'longitudinal', 'within_1m'):
             df[f'd_{m}'] = df.apply(lambda r: r[m] - base.loc[r.lap, m] if r.lap in base.index else float('nan'), axis=1)
-    df.to_csv(os.path.join(a.root, 'results.csv'), index=False)
+    df.to_csv(os.path.join(a.root, f'results{sfx}.csv'), index=False)
     cols = [c for c in ['lap', 'scenario', 'coverage', 'rmse', 'd_rmse', 'lateral', 'longitudinal', 'yaw_deg',
                         'p95', 'within_1m', 'd_within_1m', 'run_s'] if c in df]
-    with open(os.path.join(a.root, 'results.md'), 'w') as f:
+    with open(os.path.join(a.root, f'results{sfx}.md'), 'w') as f:
         try:
             f.write(df[cols].to_markdown(index=False, floatfmt='.3f'))
         except ImportError:                      # tabulate not installed
             f.write(df[cols].to_string(index=False))
     print(df[cols].to_string(index=False))
-    print(f'-> {a.root}/results.csv, results.md')
+    print(f'-> {a.root}/results{sfx}.csv, results{sfx}.md')
 
 
 if __name__ == '__main__':

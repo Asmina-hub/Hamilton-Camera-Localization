@@ -100,6 +100,15 @@ def main():
     ap.add_argument('--min-inl', type=int, default=15)
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--pf-config', default=None, help='JSON with {"params": {...}} overriding PFParams defaults')
+    ap.add_argument('--roma-fallback', type=int, default=0,
+                    help='N > 0: after N image sets without an accepted fix, relocalize with RoMa against the same '
+                         'keyframe map (needs <maps>/kf_<cam>_img.npz, scripts/add_kf_images.py). 0 = off')
+    ap.add_argument('--roma-model', default='outdoor', choices=['outdoor', 'tiny'])
+    ap.add_argument('--roma-coarse', type=int, default=560)
+    ap.add_argument('--roma-upsample', type=int, default=864)
+    ap.add_argument('--roma-fused-corr', action='store_true', help='optional fused kernel (romatch[fused-local-corr])')
+    ap.add_argument('--roma-n-kf', type=int, default=1, help='keyframes matched per RoMa call')
+    ap.add_argument('--roma-max-calls', type=int, default=1, help='RoMa calls per image set at most')
     a = ap.parse_args()
     cams = a.cams.split(',')
     work = a.work or os.path.splitext(a.out)[0] + '_work'
@@ -130,6 +139,14 @@ def main():
             for k, v in json.load(f)['params'].items():
                 setattr(params, k, v)
     pf = ParticleFilter(tm, (x0, y0, yaw0), params, a.seed)
+    fallbacks = {}
+    if a.roma_fallback > 0:
+        from camloc.roma_fallback import load_roma, RomaFallback, KeyframeImages
+        roma = load_roma(a.roma_model, a.roma_coarse, a.roma_upsample, a.roma_fused_corr)
+        fallbacks = {c: RomaFallback(roma, kfmaps[c], KeyframeImages(f'{a.maps}/kf_{c}_img.npz'), masks[c])
+                     for c in cams}
+    no_fix = 0                                   # image sets since the last accepted fix
+    n_roma_calls = n_roma_fixes = 0
 
     # ---- 2. online loop
     rows, log = [], []
@@ -148,7 +165,23 @@ def main():
             r = kfmaps[c].localize(feats, feats.extract(gray, masks[c]), pf.estimate(), n_kf=a.n_kf)
             if r['ok'] and r['n_inl'] >= a.min_inl and pf.update_fix(r['x'], r['y'], r['yaw']):
                 n_used += 1
-            log.append(dict(timestamp_ns=t, cam=c, ok=int(r['ok']), n_inl=r['n_inl'], x=r['x'], y=r['y'], yaw=r['yaw']))
+            log.append(dict(timestamp_ns=t, cam=c, src='aliked', ok=int(r['ok']), n_inl=r['n_inl'], x=r['x'], y=r['y'],
+                            yaw=r['yaw']))
+        # RoMa fallback: only after a run of image sets without any accepted fix (the filter bridges short gaps)
+        if fallbacks and n_used == 0 and no_fix + 1 >= a.roma_fallback:
+            calls = 0
+            for c in cams:
+                if c not in jpegs or calls >= a.roma_max_calls:
+                    continue
+                calls += 1; n_roma_calls += 1
+                r = fallbacks[c].localize(jpegs[c], pf.estimate(), n_kf=a.roma_n_kf, min_inliers=a.min_inl)
+                used = r['ok'] and r['n_inl'] >= a.min_inl and pf.update_fix(r['x'], r['y'], r['yaw'])
+                log.append(dict(timestamp_ns=t, cam=c, src='roma', ok=int(r['ok']), n_inl=r['n_inl'], x=r['x'],
+                                y=r['y'], yaw=r['yaw']))
+                if used:
+                    n_used += 1; n_roma_fixes += 1
+                    break
+        no_fix = 0 if n_used else no_fix + 1
         rows.append((t,) + pf.estimate())
         torch.cuda.synchronize()
         log[-1]['ms'] = (time.perf_counter() - tic) * 1e3
@@ -163,10 +196,12 @@ def main():
     lg.to_csv(os.path.splitext(a.out)[0] + '_log.csv', index=False, float_format='%.6f')
     ms = lg.ms.dropna()
     timing = dict(frames=len(rows), mean_ms=float(ms.mean()), median_ms=float(ms.median()), p95_ms=float(ms.quantile(0.95)),
-                  gpu=torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none', cams=cams)
+                  gpu=torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none', cams=cams,
+                  roma_fallback=a.roma_fallback, roma_calls=n_roma_calls, roma_fixes_used=n_roma_fixes)
     with open(os.path.splitext(a.out)[0] + '_timing.json', 'w') as o:
         json.dump(timing, o, indent=1)
-    print(f'{len(rows)} poses -> {a.out}   {timing["mean_ms"]:.0f} ms/frame mean ({timing["gpu"]})')
+    print(f'{len(rows)} poses -> {a.out}   {timing["mean_ms"]:.0f} ms/frame mean ({timing["gpu"]})'
+          + (f'   RoMa calls {n_roma_calls}, fixes used {n_roma_fixes}' if fallbacks else ''))
 
 
 if __name__ == '__main__':

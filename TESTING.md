@@ -104,6 +104,25 @@ Every test file also starts from a **different place** than the full run (start 
 
 Suites for `run_testsets.py`: `quick` (6), `single` (all single-factor), `combined`, `all`.
 
+## Comparing pipeline variants on the same test files
+
+`run_testsets.py --tag NAME` writes `submission_NAME.csv`, `run_NAME.log` and `results_NAME.csv/md`, so several
+variants can be scored on the same files. `--wait-built SECONDS` waits for another job to build each test file
+instead of building it, so a second variant can run as a parallel GPU job behind the first.
+
+```bash
+# job 1: baseline (builds maps_no26 and the test files)
+BAG=... ROOT=$WS/camloc_testsets bash scripts/robustness_gpu.sh
+# job 2, at the same time: RoMa fallback (waits for job 1's maps and test files)
+BAG=... ROOT=$WS/camloc_testsets bash scripts/robustness_roma_gpu.sh
+# side by side, with the differences
+python scripts/compare_results.py $WS/camloc_testsets --tags ,roma --names baseline,roma
+```
+
+The RoMa fallback (`run.py --roma-fallback N`, `camloc/roma_fallback.py`) relocalizes against the same keyframe
+map with RoMa after N image sets without an accepted ALIKED fix. It needs the keyframe images,
+`maps_no26/kf_<cam>_img.npz`, from `scripts/add_kf_images.py` (one bag pass per camera, no map rebuild).
+
 ## Limits
 
 - **Synthetic lighting is not real daylight.** Brightening a night image does not create daylight textures,
