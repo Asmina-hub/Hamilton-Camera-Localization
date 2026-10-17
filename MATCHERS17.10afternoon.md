@@ -19,7 +19,8 @@ synthetic perturbations (dark, lamps removed, crude daylight stand-in, motion bl
   nothing for any matcher.
 
 **Proposal:** keep ALIKED + LightGlue as the main matcher and add RoMa as a fallback when the ALIKED fix fails.
-The decision is pending the "combined" estimate in section 7.
+Combined (section 7), this solves 86.7 % of the dark queries instead of 73.5 %, with RoMa needed on 15–27 % of the
+frames.
 
 ---
 
@@ -165,11 +166,37 @@ Time is per query match on the A100 (query feature extraction + matching for spa
 
 ---
 
-## 7. Decision and next steps
+## 7. Combined estimate: ALIKED, with RoMa only when ALIKED fails
+
+From `out/exp_roma/per_query.csv`: use the ALIKED fix when it succeeds, otherwise the RoMa fix.
+
+| Perturbation | ALIKED solved | ALIKED + RoMa fallback | RoMa needed on | Within 1 m, ALIKED → combined |
+|---|---|---|---|---|
+| clean | 85.0 % | **92.9 %** | 15.0 % of frames | 77.0 → 80.5 % |
+| dark | 73.5 % | **86.7 %** | 26.5 % | 67.3 → **76.1 %** |
+| lamps off | 82.3 % | **92.9 %** | 17.7 % | 77.0 → 81.4 % |
+| day proxy | 81.4 % | **92.9 %** | 18.6 % | 72.6 → 77.9 % |
+| blur | 83.2 % | **92.9 %** | 16.8 % | 61.1 → 64.6 % |
+
+- RoMa solves every query that ALIKED solves, so the combination reaches RoMa's solve rate while ALIKED handles
+  most frames.
+- The largest gain is in the dark: **+13 points** solved, **+9 points** within 1 m.
+- Runtime: calling RoMa on every failed frame would add on average about 70 ms per frame (clean) to 125 ms (dark)
+  on an A100: too much for the 100 ms target. The filter already bridges short gaps, so RoMa should only be called
+  after several frames without an accepted fix (or at a lower resolution).
+- "Within 1 m" rises less than "solved": some rescued fixes are more than 1 m off. The filter's outlier gate is
+  meant for these.
+
+**Decision:** build the RoMa fallback, triggered only after a run of failed frames, and judge it end to end with
+`run.py` on laps 2 and 6 (clean and perturbed test files) against the unchanged pipeline.
+
+---
+
+## 8. Next steps
 
 | Priority | Work | Purpose | Evaluated on |
 |---|---|---|---|
-| 1 | **Combined estimate** from `per_query.csv`: ALIKED, and RoMa only when ALIKED fails. Report the solved % and the share of frames that need RoMa | Decide whether the fallback is worth it and what it costs in runtime | Lap 6 (this test) |
+| 1 | **Baseline robustness of the unchanged pipeline:** `run.py` (fl + rl, `configs/fl_rl.json`, `maps_no26`) on laps 2 and 6 test files: clean, faster, dark, lamps off, dropped frames, fl dead (`scripts/robustness_gpu.sh`) | Reference for the fallback; failure-analysis slide | Laps 2 and 6 |
 | 2 | **RoMa fallback in the keyframe map:** store the keyframe images (or their stamps) in `kf_*.npz`, and in `localize` run RoMa on the nearest keyframe when the ALIKED fix fails, looking up the stored 3D keypoint pixels in the dense warp (as in `exp_roma.py`) | More fixes in dark / changed light | Laps 2 and 6 with `run.py`, clean and `@dark` / `@day_proxy` test files |
 | 3 | **Runtime budget:** run RoMa only after N failed frames, or at most every k-th frame; lower resolution (`--roma-coarse 420 --roma-upsample 672`) | Keep the 100 ms target on average | Laps 2 and 6 |
 | 4 | Repeat the comparison for `rl` | The pipeline uses fl + rl | Lap 6 |
@@ -177,7 +204,7 @@ Time is per query match on the A100 (query feature extraction + matching for spa
 
 ---
 
-## 8. Reproduce
+## 9. Reproduce
 
 ```bash
 export WS=<workspace>                       # dataset, conda env and torch cache
