@@ -89,7 +89,7 @@ class Roma:
         if tiny:
             self.m = romatch.tiny_roma_v1_outdoor(device=DEV)
         else:
-            kw = dict(coarse_res=a.roma_coarse, upsample_res=a.roma_upsample)
+            kw = dict(coarse_res=a.roma_coarse, upsample_res=a.roma_upsample, use_custom_corr=a.roma_fused_corr)
             self.m = romatch.roma_outdoor(device=DEV, **kw)
         self.num, self.cert_th = a.num, a.cert_th
 
@@ -241,6 +241,8 @@ def main():
                     help='";"-separated testgen specs applied to the query image ("clean" = none)')
     ap.add_argument('--roma-coarse', type=int, default=560, help='RoMa coarse resolution (multiple of 14)')
     ap.add_argument('--roma-upsample', type=int, default=864)
+    ap.add_argument('--roma-fused-corr', action='store_true',
+                    help='use the optional fused local-correlation kernel (pip install romatch[fused-local-corr])')
     ap.add_argument('--num', type=int, default=5000, help='RoMa matches sampled for triangulation')
     ap.add_argument('--cert-th', type=float, default=0.3)
     ap.add_argument('--loma-kpts', type=int, default=2048, help='LoMa keypoints per image')
