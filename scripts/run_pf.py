@@ -18,6 +18,42 @@ from camloc.motion import increments
 from camloc.pf import ParticleFilter, PFParams
 
 
+def load_fixes(path, min_inl=15):
+    fx = pd.read_csv(path)
+    fx = fx[(fx.ok == 1) & (fx.n_inl >= min_inl)]
+    out = {}
+    for r in fx.itertuples():                 # several cameras per stamp -> list of fixes
+        out.setdefault(int(r.timestamp_ns), []).append((r.x, r.y, r.yaw))
+    return out
+
+
+def run_filter(cache, gt_csv, params, fixes=None, seed=0, stamps=None):
+    """Replay the filter over the run at `stamps` (default: fl image stamps; pass the online run's image-set
+    stamps when replaying its fixes). Returns (poses DataFrame, fixes used, fixes gated, ms/frame)."""
+    tm = TrackMap(f'{cache}/track_bounds.npz')
+    g0 = pd.read_csv(gt_csv, nrows=1)
+    t0 = int(g0.timestamp_ns[0])
+    f = pd.read_csv(f'{cache}/frames.csv')
+    img_t = np.sort(f[f.cam == 'fl'].timestamp_ns.values) if stamps is None else np.sort(np.asarray(stamps))
+    inc = increments(f'{cache}/state.csv', img_t, t0)
+    fixes = fixes or {}
+
+    pf = ParticleFilter(tm, (g0.x[0], g0.y[0], g0['yaw'][0]), params, seed)
+    rows, n_used, n_gated, tic = [], 0, 0, time.perf_counter()
+    for t, dx, dy, dyaw, dt, dist in inc.itertuples(index=False):
+        pf.predict(dx, dy, dyaw, dt)
+        if dist > 0.05:                       # the map constraints carry no information at standstill
+            pf.update_map()
+        for fx in fixes.get(t, ()):
+            if pf.update_fix(*fx):
+                n_used += 1
+            else:
+                n_gated += 1
+        rows.append((t,) + pf.estimate())
+    ms = (time.perf_counter() - tic) / len(rows) * 1e3
+    return pd.DataFrame(rows, columns=['timestamp_ns', 'x', 'y', 'yaw']), n_used, n_gated, ms
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('cache'); ap.add_argument('gt'); ap.add_argument('out')
@@ -28,37 +64,12 @@ def main():
         ap.add_argument('--' + k.replace('_', '-'), type=type(v.default), default=v.default)
     a = ap.parse_args()
     params = PFParams(**{k: getattr(a, k) for k in PFParams.__dataclass_fields__})
-
-    tm = TrackMap(f'{a.cache}/track_bounds.npz')
-    g0 = pd.read_csv(a.gt, nrows=1)
-    t0 = int(g0.timestamp_ns[0])
-    f = pd.read_csv(f'{a.cache}/frames.csv')
-    img_t = np.sort(f[f.cam == 'fl'].timestamp_ns.values)
-    inc = increments(f'{a.cache}/state.csv', img_t, t0)
-    fixes = {}
-    if a.fixes:
-        fx = pd.read_csv(a.fixes)
-        fx = fx[(fx.ok == 1) & (fx.n_inl >= a.min_inl)]
-        fixes = {int(r.timestamp_ns): (r.x, r.y, r.yaw) for r in fx.itertuples()}
-
-    pf = ParticleFilter(tm, (g0.x[0], g0.y[0], g0['yaw'][0]), params, a.seed)
-    rows, n_used, n_gated, tic = [], 0, 0, time.perf_counter()
-    for t, dx, dy, dyaw, dt, dist in inc.itertuples(index=False):
-        pf.predict(dx, dy, dyaw, dt)
-        if dist > 0.05:                       # the map constraints carry no information at standstill
-            pf.update_map()
-        if t in fixes:
-            if pf.update_fix(*fixes[t]):
-                n_used += 1
-            else:
-                n_gated += 1
-        rows.append((t,) + pf.estimate())
-    el = time.perf_counter() - tic
-
+    fixes = load_fixes(a.fixes, a.min_inl) if a.fixes else None
+    stamps = pd.read_csv(a.fixes).timestamp_ns.unique() if a.fixes else None
+    poses, n_used, n_gated, ms = run_filter(a.cache, a.gt, params, fixes, a.seed, stamps)
     os.makedirs(os.path.dirname(a.out) or '.', exist_ok=True)
-    pd.DataFrame(rows, columns=['timestamp_ns', 'x', 'y', 'yaw']).to_csv(a.out, index=False, float_format='%.6f')
-    print(f'{len(rows)} poses -> {a.out}   filter {el / len(rows) * 1e3:.2f} ms/frame   '
-          f'fixes used {n_used}, gated {n_gated}')
+    poses.to_csv(a.out, index=False, float_format='%.6f')
+    print(f'{len(poses)} poses -> {a.out}   filter {ms:.2f} ms/frame   fixes used {n_used}, gated {n_gated}')
 
 
 if __name__ == '__main__':

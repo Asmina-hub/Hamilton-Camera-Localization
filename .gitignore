@@ -7,3 +7,5 @@ cache/
 out/
 __pycache__/
 *.pyc
+maps/
+maps_no26/
