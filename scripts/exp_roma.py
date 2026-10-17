@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Matcher shoot-out: ALIKED + LightGlue (current pipeline) vs RoMa vs Tiny RoMa for absolute relocalization,
+"""Matcher shoot-out: ALIKED + LightGlue (current pipeline) vs RoMa / Tiny RoMa (dense) vs LoMa (sparse) for absolute
+relocalization,
 on clean and perturbed query images (development only, uses GT to pick reference frames and to score).
 
-    python scripts/exp_roma.py BAG cache gt.csv --query-lap 6 --matchers aliked,roma,tiny_roma \
+    python scripts/exp_roma.py BAG cache gt.csv --query-lap 6 --matchers aliked,loma_b,tiny_roma,roma \
         --perturb "clean;@dark;lamps_off;@day_proxy;@blur_only" --out out/exp_roma
 
 For every N-th query image of the held-out lap (default lap 6, camera fl):
@@ -138,6 +139,74 @@ class Roma:
         return np.where(ok)[0], qp[ok]
 
 
+class LoMaM:
+    """LoMa (Edstedt et al. 2026, lomatch): DaD keypoints + DeDoDe descriptors + LightGlue-style matcher.
+    Variants: loma_b (LightGlue-sized, default), loma_b128, loma_l, loma_g (heaviest, most accurate)."""
+
+    def __init__(self, a, variant='b'):
+        import tempfile
+        import loma
+        from loma.loma import filter_matches, to_pixel_coords
+        cfg = {'b': loma.LoMaB, 'b128': loma.LoMaB128, 'l': loma.LoMaL, 'g': loma.LoMaG}[variant]
+        self.name = f'loma_{variant}'
+        self.m = loma.LoMa(cfg())
+        self.m.eval()
+        self._filter, self._px = filter_matches, to_pixel_coords
+        self.tmp = tempfile.mkdtemp(prefix='loma_')
+        self.n_kpts = a.loma_kpts
+        self.cache = {}
+
+    def _feat(self, key, img):
+        if key is not None and key in self.cache:
+            return self.cache[key]
+        path = os.path.join(self.tmp, 'im.png')
+        cv2.imwrite(path, img)                                        # lossless; LoMa's own loader resizes
+        k, d, h, w = self.m.detect_and_describe(path, self.n_kpts)
+        f = (k, d, self._px(k[0], h, w).float().cpu().numpy())
+        if key is not None:
+            self.cache[key] = f
+        return f
+
+    @torch.inference_mode()
+    def _match(self, fa, fb):
+        scores = self.m(fa[0], fb[0], fa[1], fb[1])['scores']
+        m0 = self._filter(scores, self.m.cfg.filter_threshold)[0][0]
+        valid = (m0 > -1)
+        ia = torch.where(valid)[0].cpu().numpy(); ib = m0[valid].cpu().numpy()
+        return fa[2][ia], fb[2][ib]
+
+    @staticmethod
+    def _on_body(p, mask):
+        if mask is None or len(p) == 0:
+            return np.zeros(len(p), bool)
+        h, w = mask.shape
+        return mask[np.clip(p[:, 1].astype(int), 0, h - 1), np.clip(p[:, 0].astype(int), 0, w - 1)]
+
+    def pair(self, key_a, img_a, mask_a, key_b, img_b, mask_b):
+        pa, pb = self._match(self._feat(key_a, img_a), self._feat(key_b, img_b))
+        keep = ~self._on_body(pa, mask_a) & ~self._on_body(pb, mask_b)
+        return pa[keep], pb[keep]
+
+    def lookup(self, key_r, img_r, mask_r, pts_r, key_q, img_q, mask_q):
+        pr, pq = self.pair(key_r, img_r, mask_r, key_q, img_q, mask_q)
+        if len(pr) == 0 or len(pts_r) == 0:
+            return np.zeros(0, int), np.zeros((0, 2))
+        d = np.linalg.norm(pts_r[:, None] - pr[None], axis=2)      # pts_r are a subset of r's keypoints
+        j = d.argmin(1)
+        ok = d[np.arange(len(pts_r)), j] < 0.5
+        return np.where(ok)[0], pq[j[ok]]
+
+
+def make_matcher(name, a):
+    if name == 'aliked':
+        return AlikedLG(a)
+    if name in ('roma', 'tiny_roma'):
+        return Roma(a, tiny=(name == 'tiny_roma'))
+    if name.startswith('loma'):
+        return LoMaM(a, variant=name.split('_', 1)[1] if '_' in name else 'b')
+    raise ValueError(f'unknown matcher {name}: aliked, roma, tiny_roma, loma_b, loma_b128, loma_l, loma_g')
+
+
 # ------------------------------------------------------------------------------------------- geometry
 
 def pnp(cam, obj, img, reproj=3.0, min_inl=15):
@@ -174,6 +243,7 @@ def main():
     ap.add_argument('--roma-upsample', type=int, default=864)
     ap.add_argument('--num', type=int, default=5000, help='RoMa matches sampled for triangulation')
     ap.add_argument('--cert-th', type=float, default=0.3)
+    ap.add_argument('--loma-kpts', type=int, default=2048, help='LoMa keypoints per image')
     ap.add_argument('--vis', type=int, default=3, help='save match pictures for the first N queries')
     ap.add_argument('--out', default='out/exp_roma')
     a = ap.parse_args()
@@ -232,7 +302,7 @@ def main():
     rows = []
     for mname in a.matchers.split(','):
         tic = time.time()
-        M = AlikedLG(a) if mname == 'aliked' else Roma(a, tiny=(mname == 'tiny_roma'))
+        M = make_matcher(mname, a)
         print(f'== {mname} loaded ({time.time() - tic:.0f} s)', flush=True)
         for n, (tq, t1, t2, dref) in enumerate(pairs):
             if tq not in imgs or t1 not in imgs or t2 not in imgs:
