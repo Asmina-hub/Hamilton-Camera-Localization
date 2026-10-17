@@ -31,7 +31,7 @@ for c in ${CAMS//,/ }; do
   [ -f maps_no26/kf_${c}_img.npz ] || $PY scripts/add_kf_images.py "$BAG" cache gt.csv maps_no26/kf_$c.npz --cam $c
 done
 step "3/3 suite '$SUITE' on laps $LAPS with the RoMa fallback (N=$N) -> $ROOT"
-$PY scripts/run_testsets.py "$BAG" gt.csv --laps $LAPS --suite $SUITE --root "$ROOT" --tag roma --wait-built 14400 \
+$PY scripts/run_testsets.py "$BAG" gt.csv --laps $LAPS --suite $SUITE --root "$ROOT" --skip-run-existing --tag roma --wait-built 14400 \
   --cmd "$PY run.py {mcap} {csv} --cams $CAMS --maps maps_no26 --pf-config configs/fl_rl.json --roma-fallback $N $ROMA_ARGS"
 [ -f "$ROOT/results.csv" ] && $PY scripts/compare_results.py "$ROOT" --tags ,roma --names baseline,roma || true
 step "done: $ROOT/results_roma.md"

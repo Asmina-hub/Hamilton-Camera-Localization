@@ -10,7 +10,9 @@ The test file looks like the hidden run as far as we know it:
 The ground truth of the window goes to gt.csv (time-mapped like the file) for tools/evaluate.py.
 """
 import json, math, os, struct, time
-from multiprocessing import Pool
+import multiprocessing as mp
+from collections import deque
+from concurrent.futures import Future, ProcessPoolExecutor
 
 import cv2
 import numpy as np
@@ -234,8 +236,18 @@ def build(bag, gt_csv, out_dir, t0, t1, spec='', seed=0, workers=4, jpeg_quality
             else:
                 yield ('raw', ch.id, m.log_time, m.data, schema.id, None, None, None)
 
-    pool = Pool(workers, initializer=_init_worker, initargs=(spec, seed, ctx, jpeg_quality)) if has_img_tf else None
-    it = pool.imap(_work, items(), chunksize=4) if pool else map(_work_passthrough, items())
+    pool = None
+    if has_img_tf and workers > 1:
+        # fresh ('spawn') workers: a forked worker can hang forever on Linux (OpenCV / BLAS threads of the parent);
+        # only images go to the workers, everything else passes through in order; a dead or stuck worker raises
+        pool = ProcessPoolExecutor(workers, mp_context=mp.get_context('spawn'), initializer=_init_worker,
+                                   initargs=(spec, seed, ctx, jpeg_quality))
+        it = _ordered(pool, items(), ahead=16 * workers, label=label)
+    elif has_img_tf:
+        _init_worker(spec, seed, ctx, jpeg_quality)
+        it = map(_work, items())
+    else:
+        it = map(_work_passthrough, items())
     n_out = 0
     for item in it:
         kind, ch_id, log_t, data = item[:4]
@@ -288,7 +300,7 @@ def build(bag, gt_csv, out_dir, t0, t1, spec='', seed=0, workers=4, jpeg_quality
             write(ch, tmap(log_t), data)
         n_out += 1
     if pool:
-        pool.close(); pool.join()
+        pool.shutdown()
     w.finish(); fo.close(); f.close()
 
     manifest = dict(
@@ -308,6 +320,27 @@ def build(bag, gt_csv, out_dir, t0, t1, spec='', seed=0, workers=4, jpeg_quality
 
 def _work_passthrough(item):
     return item
+
+
+def _ordered(pool, items, ahead=64, timeout_s=600, label=''):
+    """Images through the worker pool, other messages straight through, output in input order."""
+    q, n, tic = deque(), 0, time.time()
+
+    def out(x):
+        nonlocal n
+        if isinstance(x, Future):
+            x = x.result(timeout=timeout_s)          # TimeoutError / BrokenProcessPool instead of a silent hang
+            n += 1
+            if n % 2000 == 0:
+                print(f'  [{label}] {n} images, {n / (time.time() - tic):.0f} img/s', flush=True)
+        return x
+
+    for item in items:
+        q.append(pool.submit(_work, item) if item[0] == 'img' else item)
+        while len(q) > ahead:
+            yield out(q.popleft())
+    while q:
+        yield out(q.popleft())
 
 
 def make_preview(bag, t0, t1, spec, seed, ctx, path, speed_at, frac=0.35):

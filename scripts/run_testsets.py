@@ -67,13 +67,28 @@ def main():
         for name, spec in scen.items():
             d = os.path.join(a.root, f'lap{lap}_{name}')
             waited = 0
-            while a.wait_built and not os.path.exists(os.path.join(d, 'manifest.json')) and waited < a.wait_built:
+            failed = lambda: os.path.exists(os.path.join(d, 'BUILD_FAILED'))
+            while a.wait_built and not os.path.exists(os.path.join(d, 'manifest.json')) and not failed() \
+                    and waited < a.wait_built:
                 if waited == 0:
                     print(f'[wait]  lap {lap} {name}: test file not built yet', flush=True)
                 time.sleep(30); waited += 30
+            if a.wait_built and failed() and not os.path.exists(os.path.join(d, 'manifest.json')):
+                print(f'[skip]  lap {lap} {name}: the other job could not build it', flush=True)
+                rows.append(dict(lap=lap, scenario=name, spec=spec, exit='build failed'))
+                continue
             if a.rebuild or not os.path.exists(os.path.join(d, 'manifest.json')):
                 print(f'[build] lap {lap} {name}: {spec!r}', flush=True)
-                build(a.bag, a.gt, d, t0, t1, spec, a.seed, a.workers, label=f'lap{lap}_{name}')
+                try:
+                    if os.path.exists(os.path.join(d, 'BUILD_FAILED')):
+                        os.remove(os.path.join(d, 'BUILD_FAILED'))
+                    build(a.bag, a.gt, d, t0, t1, spec, a.seed, a.workers, label=f'lap{lap}_{name}')
+                except Exception as e:                       # one broken scenario must not stop the suite
+                    print(f'[error] lap {lap} {name}: build failed: {e!r}', flush=True)
+                    os.makedirs(d, exist_ok=True)
+                    open(os.path.join(d, 'BUILD_FAILED'), 'w').write(repr(e) + '\n')
+                    rows.append(dict(lap=lap, scenario=name, spec=spec, exit='build failed'))
+                    continue
             row = dict(lap=lap, scenario=name, spec=spec)
             if a.cmd:
                 csv = os.path.join(d, f'submission{sfx}.csv')

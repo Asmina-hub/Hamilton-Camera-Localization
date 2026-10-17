@@ -31,6 +31,6 @@ for c in ${CAMS//,/ }; do
   [ -f maps_no26/kf_$c.npz ] || $PY scripts/build_kf_map.py "$BAG" cache gt.csv maps_no26/kf_$c.npz --cam $c --exclude-laps 2,6
 done
 step "3/3 suite '$SUITE' on laps $LAPS -> $ROOT"
-$PY scripts/run_testsets.py "$BAG" gt.csv --laps $LAPS --suite $SUITE --root "$ROOT" \
+$PY scripts/run_testsets.py "$BAG" gt.csv --laps $LAPS --suite $SUITE --root "$ROOT" --skip-run-existing \
   --cmd "$PY run.py {mcap} {csv} --cams $CAMS --maps maps_no26 --pf-config configs/fl_rl.json"
 step "done: $ROOT/results.md"
